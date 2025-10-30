@@ -27,7 +27,7 @@ MOMENTUM_TIMEFRAMES: list[int] = [5, 10, 20, 50]        # List of timeframes (in
 
 # ------------------DATA SPLITTING------------------
 TRAINING_SET_PERCENTAGE: float = 70                     # Percentage of data used for training
-VALIDATION_SET_PERCENTAGE: float = (1 - 0.5/0.7) * 100  # Percentage of data used for validation during training out of the training set. Ensure as 50/20/30 split between train/val/test.
+VALIDATION_SET_PERCENTAGE: float = (1 - 0.5/(TRAINING_SET_PERCENTAGE/100)) * 100  # Percentage of data used for validation during training out of the training set. Ensure as 50/20/30 split between train/val/test.
 MIN_MONEYNESS: float = 0.8                              # Minimum moneyness of options to include
 MAX_MONEYNESS: float = 1.2                              # Maximum moneyness of options to include
 
@@ -35,7 +35,7 @@ MAX_MONEYNESS: float = 1.2                              # Maximum moneyness of o
 RUN_HYPERPARAMETER_TUNING: bool = True                  # Run hyperparameter tuning
 TUNER_DIR: str = 'hyperband_tuner'                      # Path to store the hyperparameter tuning results      
 SETTINGS = {
-    "num_epochs_final_training": 500,                   # The number of epochs to train the final model after hyperparameter tuning is complete, or during each retraining fold.
+    "num_epochs_final_training": 5,                   # The number of epochs to train the final model after hyperparameter tuning is complete, or during each retraining fold.
     "early_stopping_patience": 50,                      # Number of epochs with no improvement after which training will be stopped
     "overwrite_tuner": False,                           # If True, deletes the previous tuner directory and starts a fresh hyperparameter search. If False, attempts to resume the last search.
     "initial_guess": [0.04, 2.0, 0.07, 0.5, -0.7],      # Initial guess for the Heston parameters [v0, kappa, theta, sigma, rho]. Used to initialize the neural network's bias to start near a reasonable solution.
@@ -48,7 +48,8 @@ SETTINGS = {
     "MIN_FOLD_DAYS": 20,                                # Minimum number of days per fold when performance is monitored and model is recalibrated
     "MAX_FOLD_DAYS": 100,                               # Maximum number of days per fold when performance is monitored and model is recalibrated
     "RECALIBRATION_THRESHOLD_FACTOR": 1.15,             # The factor by which the new error mean must exceed the previous mean to trigger a recalibration. 1.15 means a 15% increase.
-    "gradient_method": "central"                        # Options: "central" (more accurate) or "forward" (faster) 
+    "gradient_method": "forward",                       # Options: "central" (more accurate) or "forward" (faster ~ 1.5x speedup) 
+    "OPTION_SUBSAMPLE_PERCENTAGE": 80.0                 # Percentage of options to use per day to speed up training. Set to 100.0 to use all options.
 }                     
 
 # ------------------MODELS------------------

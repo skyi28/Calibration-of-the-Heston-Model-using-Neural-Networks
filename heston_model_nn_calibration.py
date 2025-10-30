@@ -488,17 +488,11 @@ def prepare_option_helpers(eval_date_str, options_df, features_df, dividend):
         options_df['strike'] / (row['underlying_price'])
     )
     # Filter options based on moneyness and valid bid-ask spreads.
-    msg = f'--- Filtering Pptions on Moneyness and Bid-Ask Spreads ---\nLen options_df before filtering: {len(options_df)}'
-    logger.info(msg)
-    print(msg)
     options_df = options_df[
     (options_df['moneyness'] >= config.MIN_MONEYNESS) & (options_df['moneyness'] <= config.MAX_MONEYNESS) &
     (options_df['bid'] > 0) &
     (options_df['ask'] > options_df['bid'])
     ].copy()
-    msg = f'Len options_df after filtering: {len(options_df)}'
-    logger.info(msg)
-    print(msg)
     
     helpers = []
     # Iterate through each option contract to create a QuantLib helper.
@@ -516,6 +510,36 @@ def prepare_option_helpers(eval_date_str, options_df, features_df, dividend):
                                 r['vega'] / (r['ask'] - r['bid']), # Vega-based weight
                                 strike))
     return helpers, rf_h, div_h, spot_h
+
+
+def preprocess_ql_helpers(daily_data: List) -> List:
+    """
+    Pre-calculates QuantLib helpers for all days in a dataset to avoid
+    re-computation in every training epoch.
+
+    Parameters
+    ----------
+    daily_data : List
+        A list of tuples, where each is (date_string, options_df, features_df).
+
+    Returns
+    -------
+    List
+        A new list of tuples, where each is now in the format:
+        (date_string, options_df, features_df, precalculated_ql_objects).
+        The precalculated_ql_objects is the tuple (helpers, rf_h, div_h, spot_h).
+    """
+    msg = "\n--- Pre-processing QuantLib Helpers for All Days ---"
+    logger.info(msg)
+    print(msg)
+    processed_list = []
+    for date_str, options_df, features_df in tqdm(daily_data, desc="Preparing QuantLib Helpers"):
+        dividend = features_df['dividend_yield'].iloc[0] if 'dividend_yield' in features_df.columns else 0.0
+        ql_objects = prepare_option_helpers(date_str, options_df, features_df, dividend)
+        processed_list.append((date_str, options_df, features_df, ql_objects))
+        
+    return processed_list
+
 
 class ResidualParameterModel(tf.keras.Model):
     """
@@ -801,12 +825,12 @@ def evaluate_single_day(model, scaler, cols, logits, day_data) -> Tuple[Dict, Li
         - A dictionary with daily summary metrics ('date', 'mae', 'rmse').
         - A list of dictionaries, each containing detailed results for a single option.
     """
-    date_str, options, features = day_data
+    date_str, options, features, ql_objects = day_data
     # Scale features and predict Heston parameters for the day.
     ftrs = scaler.transform(features[cols].values)
     params = model((ftrs, logits), training=False).numpy()[0]
     dividend = features['dividend_yield'].iloc[0] if 'dividend_yield' in features.columns else 0.0
-    helpers, rf_h, div_h, spot_h = prepare_option_helpers(date_str, options, features, dividend)
+    helpers, rf_h, div_h, spot_h = ql_objects
 
     if not helpers:
         return {'date': date_str, 'mae': np.nan, 'rmse': np.nan}, []
@@ -883,8 +907,8 @@ def _evaluate_model_on_data(model, data, scaler, cols, logits):
         The mean loss of the model on the given data. If no data is available, returns float('inf').
     """
     losses = []
-    for date, options, features in data:
-        helpers, rf_h, div_h, spot_h = prepare_option_helpers(date, options, features, features['dividend_yield'].iloc[0])
+    for date, options, features, ql_objects in data:
+        helpers, rf_h, div_h, spot_h = ql_objects
         if helpers:
             params = model((scaler.transform(features[cols].values), logits), training=False).numpy()[0]
             py_date = pd.to_datetime(date).date()
@@ -928,6 +952,7 @@ def train_model_for_fold(model, best_hps, training_data, validation_data, scaler
         model = hypermodel.build(best_hps)
     optimizer = tf.keras.optimizers.Adam(learning_rate=best_hps.get('lr'))
     patience = settings.get("early_stopping_patience", 10)
+    subsample_frac = settings.get("OPTION_SUBSAMPLE_PERCENTAGE", 100) / 100.0
     best_val_loss = float('inf')
     patience_counter = 0
     best_weights = None
@@ -937,9 +962,21 @@ def train_model_for_fold(model, best_hps, training_data, validation_data, scaler
         logger.info(msg)
         print(msg)
         # Loop through each day in the training data.
-        for date, options, features in tqdm(training_data, desc=f'Progress within epoch {epoch + 1} of fold {fold_num}'):
-            helpers, rf_h, div_h, spot_h = prepare_option_helpers(date, options, features, features['dividend_yield'].iloc[0])
+        for day_idx, (date, options, features, ql_objects) in enumerate(tqdm(training_data, desc=f'Progress within epoch {epoch + 1} of fold {fold_num}')):
+            helpers, rf_h, div_h, spot_h = ql_objects 
             if not helpers: continue
+            
+            sampled_helpers = helpers
+            if subsample_frac < 1.0:
+                # Create a deterministic but unique seed for this specific day and epoch
+                # This ensures run-to-run reproducibility while having different samples per epoch
+                day_epoch_seed = config.GLOBAL_SEED + epoch * 100000 + day_idx
+                # Create a local random number generator instance to not interfere with global state
+                rng = random.Random(day_epoch_seed)
+                num_to_sample = int(len(helpers) * subsample_frac)
+                sampled_helpers = rng.sample(helpers, num_to_sample)
+                
+            if not sampled_helpers: continue
 
             # This is the core of the custom training step.
             with tf.GradientTape() as tape:
@@ -968,7 +1005,7 @@ def train_model_for_fold(model, best_hps, training_data, validation_data, scaler
                     The gradient is calculated using the finite difference method.
                     The function returns a tuple containing the loss and the gradient function.
                     """
-                    loss, grad = tf.py_function(lambda t: _py_loss_and_grad_wrapper(t, helpers, rf_h, div_h, spot_h, settings, date), [p], [tf.float64]*2)
+                    loss, grad = tf.py_function(lambda t: _py_loss_and_grad_wrapper(t, sampled_helpers, rf_h, div_h, spot_h, settings, date), [p], [tf.float64]*2)
                     def grad_fn(dy): 
                         """
                         Gradient function for the loss calculation.
@@ -1319,17 +1356,26 @@ class HestonTuner(kt.Hyperband):
         model = self.load_model(trial) if start_epoch > 0 else self.hypermodel.build(hp)
         optimizer = tf.keras.optimizers.Adam(hp.Float('lr', 1e-4, 1e-2, sampling='log'))
         
+        subsample_frac = settings.get("OPTION_SUBSAMPLE_PERCENTAGE", 100) / 100.0
+        
         for epoch in range(start_epoch, hp.get("tuner/epochs")):
             # --- Training Step ---
-            for date, options, features in train_data:
+            for day_idx, (date, options, features, ql_objects) in enumerate(tqdm(train_data, desc=f"Epoch {epoch+1} Trial {trial.trial_id}", leave=False)):
                 helpers, rf_h, div_h, spot_h = prepare_option_helpers(date, options, features, features['dividend_yield'].iloc[0])
                 if not helpers: continue
+                
+                sampled_helpers = helpers
+                if subsample_frac < 1.0:
+                    day_epoch_seed = config.GLOBAL_SEED + epoch * 100000 + day_idx
+                    rng = random.Random(day_epoch_seed)
+                    num_to_sample = int(len(helpers) * subsample_frac)
+                    sampled_helpers = rng.sample(helpers, num_to_sample)
                 
                 with tf.GradientTape() as tape:
                     params = model((scaler.transform(features[cols].values), logits), training=True)
                     @tf.custom_gradient
                     def loss_op(p):
-                        loss, grad = tf.py_function(lambda t: _py_loss_and_grad_wrapper(t, helpers, rf_h, div_h, spot_h, settings, date), [p], [tf.float64]*2)
+                        loss, grad = tf.py_function(lambda t: _py_loss_and_grad_wrapper(t, sampled_helpers, rf_h, div_h, spot_h, settings, date), [p], [tf.float64]*2)
                         def grad_fn(dy): return dy * tf.reshape(grad, tf.shape(p))
                         return loss, grad_fn
                     loss = loss_op(params[0])
@@ -1398,6 +1444,9 @@ if __name__ == '__main__':
             logger.critical(msg)
             print(msg)
             sys.exit()
+            
+        initial_train_data_processed = preprocess_ql_helpers(initial_train_data)
+        monitoring_data_processed = preprocess_ql_helpers(monitoring_data)
 
         scaler, cols = prepare_feature_scaler(initial_train_data)
         
@@ -1454,8 +1503,9 @@ if __name__ == '__main__':
                                     executions_per_trial=SETTINGS['executions_per_trial'],
                                     directory=TUNER_DIR, project_name='heston_calibration', 
                                     overwrite=SETTINGS['overwrite_tuner'])
-                tuner.search(train_data=initial_train_data[:tuner_split_idx], val_data=initial_train_data[tuner_split_idx:], 
-                             scaler=scaler, cols=cols, logits=logits, settings=SETTINGS)
+                tuner.search(train_data=initial_train_data_processed[:tuner_split_idx],
+                             val_data=initial_train_data_processed[tuner_split_idx:], scaler=scaler,
+                             cols=cols, logits=logits, settings=SETTINGS)
                 tuner.results_summary()
                 best_hps = tuner.get_best_hyperparameters(num_trials=1)[0]
                 with open(HP_FILE_PATH, 'w') as f: json.dump(best_hps.values, f, indent=4)
@@ -1478,7 +1528,7 @@ if __name__ == '__main__':
             
             # Perform the initial model training using the best hyperparameters.
             val_split_idx = int(len(initial_train_data) * (1 - config.VALIDATION_SET_PERCENTAGE / 100))
-            initial_train_split, initial_val_split = initial_train_data[:val_split_idx], initial_train_data[val_split_idx:]
+            initial_train_split, initial_val_split = initial_train_data_processed[:val_split_idx], initial_train_data_processed[val_split_idx:]
             msg = f"Initial training data split into {len(initial_train_split)} training days and {len(initial_val_split)} validation days."
             logger.info(msg)
             print(msg)
@@ -1497,7 +1547,8 @@ if __name__ == '__main__':
         
         # Start the main adaptive window evaluation process.
         if monitoring_data:
-            run_adaptive_window_evaluation(trained_initial_model, scaler, cols, logits, SETTINGS, best_hps, initial_train_data, monitoring_data, RUN_OUTPUT_DIR)
+            run_adaptive_window_evaluation(trained_initial_model, scaler, cols, logits, SETTINGS, best_hps,
+                                           initial_train_data_processed, monitoring_data_processed, RUN_OUTPUT_DIR)
         else:
             msg = "No monitoring data available to proceed with adaptive window evaluation."
             logger.warning(msg)
