@@ -4,6 +4,8 @@ import matplotlib.dates as mdates
 from mpl_toolkits.mplot3d import Axes3D
 import numpy as np
 import os
+from typing import List
+import seaborn as sns
 
 def plot_daily_performance(summary_df, daily_metrics_df, output_dir):
     """
@@ -272,3 +274,52 @@ def plot_3d_vol_surface(surface_df, output_dir, date_str):
     plt.savefig(save_path)
     plt.close()
     print(f"Saved 3D volatility surface plot to {save_path}")
+    
+def generate_and_save_correlation_heatmap(data_split: List, title: str, output_path: str, feature_cols: List[str]|None = None):
+    """
+    Calculates the correlation matrix for a given data split and saves it as a heatmap.
+
+    Parameters
+    ----------
+    data_split : List
+        A list of data tuples, e.g., (date, options_df, features_df).
+    title : str
+        The title for the plot.
+    output_path : str
+        The full path (including filename) where the plot image will be saved.
+    """
+    if not data_split:
+        print(f"Skipping heatmap generation for '{title}' as data is empty.")
+        return
+
+    # Combine all feature DataFrames from the list into a single DataFrame
+    # This correctly handles the different tuple formats you have
+    if len(data_split[0]) == 3: # (date, options, features)
+        features_df = pd.concat([f for _, _, f in data_split], ignore_index=True)
+    elif len(data_split[0]) == 4: # (date, options, features, ql_objects)
+        features_df = pd.concat([f for _, _, f, _ in data_split], ignore_index=True)
+    else:
+        print(f"Warning: Unknown data split format for heatmap generation. Skipping '{title}'.")
+        return
+    
+    if feature_cols:
+        # Ensure all requested columns exist in the DataFrame
+        final_cols = [col for col in feature_cols if col in features_df.columns]
+        plot_df = features_df[final_cols]
+    else:
+        # If no list is provided, fall back to the old behavior (all numeric columns)
+        plot_df = features_df.select_dtypes(include=np.number)
+    
+    # Calculate the correlation matrix
+    corr_matrix = plot_df.corr()
+
+    # Generate and save the heatmap
+    plt.figure(figsize=(16, 16))
+    sns.heatmap(corr_matrix, cmap='coolwarm', annot=True, fmt=".2f") # annot=False is better for many features
+    plt.title(title, fontsize=16)
+    plt.xticks(fontsize=12)  # x-axis feature labels
+    plt.yticks(fontsize=12)
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close() # Close the plot to free up memory
+    print(f"Saved correlation heatmap to: {output_path}")

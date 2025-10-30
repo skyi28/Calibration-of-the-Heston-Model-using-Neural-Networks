@@ -40,15 +40,15 @@ SETTINGS = {
     "RECALIBRATION_THRESHOLD_FACTOR": 1.15,             # The factor by which the new error mean must exceed the previous mean to trigger a recalibration. 1.15 means a 15% increase.
     "MAX_FOLD_DAYS": 100,                               # Maximum number of days per fold when performance is monitored and model is recalibrated
     "MIN_FOLD_DAYS": 20,                                # Minimum number of days per fold when performance is monitored and model is recalibrated
-    "num_epochs_final_training": 50,                    # The number of epochs to train the final model after hyperparameter tuning is complete, or during each retraining fold.
+    "num_epochs_final_training": 100,                   # The number of epochs to train the final model after hyperparameter tuning is complete, or during each retraining fold.
     "early_stopping_patience": 10,                      # Number of epochs with no improvement after which training will be stopped
     "early_stopping_verbose": 1,                        # Verbosity level for early stopping
     "learning_rate_scheduler_patience": 3,              # Number of epochs with no improvement after which learning rate will be reduced
     "learning_rate_scheduler_factor": 0.2,              # Factor by which the learning rate will be reduced
     "learning_rate_lower_bound": 1e-7,                  # Lower bound on the learning rate
     "learning_rate_verbose": 1,                         # Verbosity level for learning rate scheduler
-    "overwrite_tuner": True,                            # If True, deletes the previous tuner directory and starts a fresh hyperparameter search. If False, attempts to resume the last search.
-    "max_epochs_tuning": 50,                             # Maximum number of epochs for each trial during hyperparameter tuning
+    "overwrite_tuner": False,                           # If True, deletes the previous tuner directory and starts a fresh hyperparameter search. If False, attempts to resume the last search.
+    "max_epochs_tuning": 50,                            # Maximum number of epochs for each trial during hyperparameter tuning
     "hyperband_factor": 4,                              # A parameter for the Hyperband algorithm that controls the reduction rate. At each stage, only the top 1/factor trials are kept.
     "executions_per_trial": 1,                          # Number of models to build and fit for each trial to reduce variance
     "initial_guess": [0.04, 2.0, 0.07, 0.5, -0.7],      # Initial guess for the Heston parameters [v0, kappa, theta, sigma, rho]. Used to initialize the neural network's bias to start near a reasonable solution.

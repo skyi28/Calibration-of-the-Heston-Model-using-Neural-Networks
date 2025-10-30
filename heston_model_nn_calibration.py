@@ -50,6 +50,7 @@ import duckdb
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
 import QuantLib as ql
 import tensorflow as tf
 from tensorflow.keras.callbacks import ReduceLROnPlateau, EarlyStopping
@@ -240,7 +241,8 @@ else:
         print(msg)
 
 
-def load_and_split_data(db_connection: duckdb.DuckDBPyConnection, symbol: str, options_table: str, features_table: str) -> Tuple[List, List]:
+def load_and_split_data(db_connection: duckdb.DuckDBPyConnection, symbol: str, options_table: str, features_table: str,
+                        pca_model: PCA|None = None, pca_cols: List[str]|None = None) -> Tuple[List, List]:
     """
     Loads and partitions the data for a specific symbol into an initial training set
     and a subsequent monitoring set for adaptive validation.
@@ -336,7 +338,7 @@ def load_and_split_data(db_connection: duckdb.DuckDBPyConnection, symbol: str, o
     logger.info(msg)
     print(msg)
 
-    def _load(dates: List[str]) -> List[Tuple[str, pd.DataFrame, pd.DataFrame]]:
+    def _load(dates: List[str], pca_model: PCA|None = None, pca_cols: List[str]|None = None) -> List[Tuple[str, pd.DataFrame, pd.DataFrame]]:
         """
         Loads option and feature data for the given dates.
 
@@ -362,6 +364,13 @@ def load_and_split_data(db_connection: duckdb.DuckDBPyConnection, symbol: str, o
         options_df['date'] = pd.to_datetime(options_df['date']).dt.tz_localize(None)
         features_df['date'] = pd.to_datetime(features_df['date']).dt.tz_localize(None)
         
+        if pca_model is not None and pca_cols is not None:
+            yield_curve_pca = pca_model.transform(features_df[pca_cols])
+            pca_col_names = [f'yc_pc_{i+1}' for i in range(pca_model.n_components)]
+            pca_df = pd.DataFrame(yield_curve_pca, columns=pca_col_names, index=features_df.index)
+            features_df = features_df.join(pca_df)
+            print(f"Applied PCA transformation, replaced {len(pca_cols)} features with {len(pca_col_names)} components.")
+        
         # Merge dividend yield data, forward-filling to handle non-trading days and filling any remaining NaNs with 0.
         if not dividend_df.empty:
             features_df = pd.merge(features_df, dividend_df, on='date', how='left')
@@ -369,7 +378,7 @@ def load_and_split_data(db_connection: duckdb.DuckDBPyConnection, symbol: str, o
         else: features_df['dividend_yield'] = 0.0
         
         # Create the Volatility Risk Premium (VRP) feature, which is the spread between implied (VIX) and realized volatility.
-        features_df['volatility_risk_premium'] = features_df['vix_index'] - features_df[f'vol_{max(config.VOLATILITY_TIMEFRAMES)}d']
+        features_df['volatility_risk_premium'] = (features_df['vix_index'] / 100) - features_df[f'vol_{max(config.VOLATILITY_TIMEFRAMES)}d']
         
         # Calculate and add the 'days_until_next_dividend' feature.
         if not dividend_dates.empty:
@@ -378,14 +387,80 @@ def load_and_split_data(db_connection: duckdb.DuckDBPyConnection, symbol: str, o
             features_df['days_until_next_dividend'] = (features_df['next_dividend_date'] - features_df['date']).dt.days.fillna(0)
             features_df.drop(columns=['next_dividend_date'], inplace=True)
         else:
-            features_df['days_until_next_dividend'] = 0.0
+            msg = f'Days until next dividend feature set to 0 for all dates as no dividend dates found for {symbol}. Dropping this feature.'
+            logger.info(msg)
+            print(msg)
+        
+        # Create the volatility term structure feature as the difference between long-term and short-term volatilities.
+        vol_short = f'vol_{min(config.VOLATILITY_TIMEFRAMES)}d'
+        vol_long = f'vol_{max(config.VOLATILITY_TIMEFRAMES)}d'
+        features_df['vol_term_slope'] = features_df[vol_long] - features_df[vol_short]
+        
+        # Create the momentum term structure feature as the difference between long-term and short-term momentum.
+        mom_short = f'momentum_{min(config.MOMENTUM_TIMEFRAMES)}d'
+        mom_long = f'momentum_{max(config.MOMENTUM_TIMEFRAMES)}d'
+        features_df['mom_term_slope'] = features_df[mom_long] - features_df[mom_short]
+                
+        # Skew/VIX ratio feature.
+        features_df['skew_vix_ratio'] = features_df['skew_index'] / features_df['vix_index']
+
+        print(f"Loaded {len(options_df)} option rows and {len(features_df)} feature rows for {len(dates)} dates.")
 
         # Group data by date and return a list of tuples, each containing the data for one day.
         options_by_date = dict(tuple(options_df.groupby('date')))
         features_by_date = dict(tuple(features_df.groupby('date')))
         return [(d, options_by_date[pd.to_datetime(d)], f) for d, f in features_by_date.items() if pd.to_datetime(d) in options_by_date and not f.empty]
 
-    return _load(initial_train_dates), _load(monitoring_dates)
+    return _load(initial_train_dates, pca_model, pca_cols), _load(monitoring_dates, pca_model, pca_cols)
+
+
+def prepare_pca_model(training_data: List, n_components: int = 3) -> Tuple[PCA, List[str]]:
+    """
+    Fits a PCA model on the yield curve features of the initial training data.
+
+    This is done to reduce dimensionality, de-correlate interest rate features,
+    and capture the fundamental drivers of the yield curve (level, slope, curvature).
+    The PCA is fitted *only* on training data to prevent lookahead bias.
+
+    Parameters
+    ----------
+    training_data : List
+        The initial training dataset, a list of (date, options_df, features_df) tuples.
+    n_components : int
+        The number of principal components to keep.
+
+    Returns
+    -------
+    Tuple[PCA, List[str]]
+        A tuple containing the fitted PCA instance and the list of yield curve
+        column names that were used.
+    """
+    msg = f"\n--- Preparing PCA Model for Yield Curve (n={n_components}) ---"
+    logger.info(msg)
+    print(msg)
+    if not training_data:
+        raise ValueError("Cannot prepare PCA with no training data.")
+    
+    # Concatenate feature dataframes from all training days
+    features = pd.concat([f for _, _, f in training_data], ignore_index=True)
+    
+    # Identify the yield curve columns
+    yield_curve_cols = sorted([c for c in features.columns if c.startswith(('month_', 'year_'))])
+    if not yield_curve_cols:
+        raise ValueError("No yield curve columns found to fit PCA.")
+    
+    print(f"Fitting PCA on {len(yield_curve_cols)} yield curve tenors.")
+    
+    pca = PCA(n_components=n_components)
+    pca.fit(features[yield_curve_cols])
+    
+    # Log the explained variance to confirm the components are meaningful
+    explained_variance = sum(pca.explained_variance_ratio_)
+    msg = f"Fitted PCA model. Explained variance of {n_components} components: {explained_variance:.2%}"
+    logger.info(msg)
+    print(msg)
+    
+    return pca, yield_curve_cols
 
 
 def prepare_feature_scaler(training_data: List) -> Tuple[StandardScaler, List[str]]:
@@ -418,8 +493,16 @@ def prepare_feature_scaler(training_data: List) -> Tuple[StandardScaler, List[st
         raise ValueError("Cannot prepare scaler with no training data.")
     # Concatenate feature dataframes from all training days.
     features = pd.concat([f for _, _, f in training_data], ignore_index=True)
-    # Identify feature columns to be scaled (i.e., all columns except identifiers).
-    cols = [c for c in features.columns if c not in ['date', 'act_symbol']]
+    # Identify feature columns to be scaled (i.e., all columns except identifiers and non PCA components of the yield curve).
+    cols_to_exclude = ['date', 'act_symbol']
+    raw_yield_curve_cols = [c for c in features.columns if c.startswith(('month_', 'year_'))]
+    cols_to_exclude.extend(raw_yield_curve_cols)
+    
+    cols = [c for c in features.columns if c not in cols_to_exclude]
+    if not cols: 
+        raise ValueError("No feature columns found to fit the scaler.")
+    
+    print(f"Scaler will be fit on these {len(cols)} columns: {cols}")
     if not cols: 
         raise ValueError("No feature columns found to fit the scaler.")
     scaler = StandardScaler().fit(features[cols].values)
@@ -584,7 +667,7 @@ class ResidualParameterModel(tf.keras.Model):
             
             self.network_layers.append(tf.keras.layers.Dense(num_neurons, use_bias=use_bias_for_batchnorm, name=f'dense_{i}'))
             if self.use_batchnorm:
-                self.network_layersappend(tf.keras.layers.BatchNormalization(name=f'batchnorm_{i}'))
+                self.network_layers.append(tf.keras.layers.BatchNormalization(name=f'batchnorm_{i}'))
             self.network_layers.append(tf.keras.layers.Activation('relu', name=f'relu_{i}'))
             if self.use_dropout:
                 self.network_layers.append(tf.keras.layers.Dropout(dropout_rate, name=f'dropout_{i}'))            
@@ -1462,17 +1545,50 @@ if __name__ == '__main__':
         logger.info(msg)
         print(msg)
 
-        initial_train_data, monitoring_data = load_and_split_data(db.connection, config.SYMBOL, config.OPTIONS_DATA_TABLE, config.FEATURES_DATA_TABLE)
-        if not initial_train_data: 
+        initial_train_data_raw, monitoring_data_raw = load_and_split_data(db.connection, config.SYMBOL, config.OPTIONS_DATA_TABLE, config.FEATURES_DATA_TABLE)
+        if not initial_train_data_raw: 
             msg = "No initial training data loaded. Aborting execution."
             logger.critical(msg)
             print(msg)
             sys.exit()
-            
+        
+        # Plot correlation heatmaps before PCA
+        plotting.generate_and_save_correlation_heatmap(
+            data_split=initial_train_data_raw,
+            title='Correlation Matrix (Training Set - Before PCA)',
+            output_path=os.path.join(RUN_OUTPUT_DIR, 'corr_train_before_pca.png')
+        )
+        plotting.generate_and_save_correlation_heatmap(
+            data_split=monitoring_data_raw,
+            title='Correlation Matrix (Monitoring Set - Before PCA)',
+            output_path=os.path.join(RUN_OUTPUT_DIR, 'corr_monitor_before_pca.png')
+        )
+                    
+        pca_model, pca_cols = prepare_pca_model(initial_train_data_raw, n_components=3)
+        
+        initial_train_data, monitoring_data = load_and_split_data(
+            db.connection, config.SYMBOL, config.OPTIONS_DATA_TABLE, config.FEATURES_DATA_TABLE,
+            pca_model=pca_model, pca_cols=pca_cols
+        )
+                
         initial_train_data_processed = preprocess_ql_helpers(initial_train_data)
         monitoring_data_processed = preprocess_ql_helpers(monitoring_data)
 
         scaler, cols = prepare_feature_scaler(initial_train_data)
+        
+        # Plot correlation heatmaps after PCA
+        plotting.generate_and_save_correlation_heatmap(
+            data_split=initial_train_data,
+            title='Correlation Matrix (Training Set - After PCA & Feature Engineering)',
+            output_path=os.path.join(RUN_OUTPUT_DIR, 'corr_train_after_pca.png'),
+            feature_cols=cols 
+        )
+        plotting.generate_and_save_correlation_heatmap(
+            data_split=monitoring_data,
+            title='Correlation Matrix (Monitoring Set - After PCA & Feature Engineering)',
+            output_path=os.path.join(RUN_OUTPUT_DIR, 'corr_monitor_after_pca.png'),
+            feature_cols=cols 
+        )
         
         # Convert the initial guess for Heston parameters into the "logit" space.
         # This is the inverse of the activation functions (sigmoid, tanh).
