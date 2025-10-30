@@ -482,6 +482,24 @@ def prepare_option_helpers(eval_date_str, options_df, features_df, dividend):
     div_h = ql.RelinkableYieldTermStructureHandle(ql.FlatForward(eval_date, dividend, day_count, ql.Continuous))
     spot_h = ql.QuoteHandle(ql.SimpleQuote(row['underlying_price']))
     
+    options_df['moneyness'] = np.where(
+        options_df['call_put'] == 'Call',
+        (row['underlying_price']) / options_df['strike'],
+        options_df['strike'] / (row['underlying_price'])
+    )
+    # Filter options based on moneyness and valid bid-ask spreads.
+    msg = f'--- Filtering Pptions on Moneyness and Bid-Ask Spreads ---\nLen options_df before filtering: {len(options_df)}'
+    logger.info(msg)
+    print(msg)
+    options_df = options_df[
+    (options_df['moneyness'] >= config.MIN_MONEYNESS) & (options_df['moneyness'] <= config.MAX_MONEYNESS) &
+    (options_df['bid'] > 0) &
+    (options_df['ask'] > options_df['bid'])
+    ].copy()
+    msg = f'Len options_df after filtering: {len(options_df)}'
+    logger.info(msg)
+    print(msg)
+    
     helpers = []
     # Iterate through each option contract to create a QuantLib helper.
     for _, r in options_df.iterrows():
@@ -691,7 +709,7 @@ def calculate_implied_volatility(option, target_price, process):
         return option.impliedVolatility(target_price, process, 1.0e-4, 100, 1e-7, 4.0)
     except Exception: 
         # The calculation can fail if the price is outside the no-arbitrage bounds.
-        msg = f"Could not calculate implied volatility for option with strike {option.strike()} and maturity {option.exercise().lastDate()}."
+        msg = f"Could not calculate implied volatility for option with target_price {target_price}."
         logger.warning(msg, exc_info=True)
         print(msg)
         return None

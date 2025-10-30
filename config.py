@@ -26,8 +26,10 @@ VOLATILITY_TIMEFRAMES: list[int] = [5, 10, 20, 50]      # List of timeframes (in
 MOMENTUM_TIMEFRAMES: list[int] = [5, 10, 20, 50]        # List of timeframes (in days) to calculate the momentum features
 
 # ------------------DATA SPLITTING------------------
-TRAINING_SET_PERCENTAGE: float = 70
+TRAINING_SET_PERCENTAGE: float = 70                     # Percentage of data used for training
 VALIDATION_SET_PERCENTAGE: float = (1 - 0.5/0.7) * 100  # Percentage of data used for validation during training out of the training set. Ensure as 50/20/30 split between train/val/test.
+MIN_MONEYNESS: float = 0.8                              # Minimum moneyness of options to include
+MAX_MONEYNESS: float = 1.2                              # Maximum moneyness of options to include
 
 # ------------------HYPERPARAMETER TUNING & TRAINING------------------
 RUN_HYPERPARAMETER_TUNING: bool = True                  # Run hyperparameter tuning

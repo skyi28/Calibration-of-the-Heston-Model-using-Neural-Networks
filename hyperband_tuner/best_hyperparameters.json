@@ -1,0 +1,15 @@
+{
+    "num_layers": 1,
+    "neurons_layer_0": 16,
+    "use_dropout": false,
+    "dropout": 0.30000000000000004,
+    "neurons_layer_1": 80,
+    "neurons_layer_2": 16,
+    "neurons_layer_3": 64,
+    "lr": 0.006531232722772538,
+    "tuner/epochs": 40,
+    "tuner/initial_epoch": 10,
+    "tuner/bracket": 2,
+    "tuner/round": 2,
+    "tuner/trial_id": "0025"
+}
