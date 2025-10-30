@@ -52,6 +52,7 @@ import pandas as pd
 from sklearn.preprocessing import StandardScaler
 import QuantLib as ql
 import tensorflow as tf
+from tensorflow.keras.callbacks import ReduceLROnPlateau, EarlyStopping
 import ruptures as rpt
 import keras_tuner as kt
 import yfinance as yf
@@ -72,7 +73,7 @@ import plotting
 # Initialize the logger to capture script execution details, warnings, and errors.
 # This is essential for debugging and monitoring long-running processes.
 try:
-    logger = create_logger("script.log")
+    logger = create_logger("calibration.log")
     logger.info("Logger initialized successfully.")
 except Exception:
     print(f"FATAL: Failed to create logger!\n{traceback.format_exc()}")
@@ -292,7 +293,7 @@ def load_and_split_data(db_connection: duckdb.DuckDBPyConnection, symbol: str, o
 
     # Fetch daily dividend yield data, as this is a crucial input for option pricing models.
     try:
-        dividend_df = utils.get_daily_dividend_yield(symbol, all_dates[0], all_dates[-1])
+        dividend_df = utils.get_daily_dividend_yield_cached(symbol, all_dates[0], all_dates[-1])
         dividend_df['date'] = pd.to_datetime(dividend_df['date']).dt.tz_localize(None)
         msg = f"Successfully fetched {len(dividend_df)} dividend yield rows for {symbol}."
         logger.info(msg)
@@ -734,8 +735,8 @@ def calculate_implied_volatility(option, target_price, process):
     except Exception: 
         # The calculation can fail if the price is outside the no-arbitrage bounds.
         msg = f"Could not calculate implied volatility for option with target_price {target_price}."
-        logger.warning(msg, exc_info=True)
-        print(msg)
+        logger.debug(msg, exc_info=True)
+        # print(msg)
         return None
 
 def perform_recalibration_tests(daily_metrics_df: pd.DataFrame, settings: Dict) -> bool:
@@ -918,10 +919,16 @@ def _evaluate_model_on_data(model, data, scaler, cols, logits):
 
 def train_model_for_fold(model, best_hps, training_data, validation_data, scaler, cols, logits, settings, fold_num):
     """
-    Trains the neural network for a single fold (either initial training or a recalibration).
+    Trains the neural network for a single fold using a custom training loop,
+    augmented with Keras callbacks for adaptive learning rate scheduling and
+    robust early stopping.
 
-    This function implements the main training loop, including per-epoch training,
-    validation, and an early stopping mechanism to prevent overfitting.
+    This function implements:
+    - A custom gradient calculation via tf.py_function.
+    - Stochastic training by subsampling options for each day to accelerate epochs.
+    - `ReduceLROnPlateau`: Automatically reduces the learning rate when validation loss stagnates.
+    - `EarlyStopping`: Stops training when no improvement is seen and automatically
+      restores the weights from the best performing epoch.
 
     Parameters
     ----------
@@ -930,7 +937,7 @@ def train_model_for_fold(model, best_hps, training_data, validation_data, scaler
     best_hps : kt.HyperParameters
         The set of best hyperparameters found by the tuner.
     training_data, validation_data : List
-        The datasets for training and validation.
+        The pre-processed datasets for training and validation.
     scaler, cols, logits, settings :
         Standard tools and settings for training.
     fold_num : int
@@ -939,72 +946,83 @@ def train_model_for_fold(model, best_hps, training_data, validation_data, scaler
     Returns
     -------
     tf.keras.Model
-        The trained model with the best weights restored.
+        The trained model with the best weights automatically restored.
     """
-    msg = f"Training model for Fold {fold_num} with {len(training_data)} training days and {len(validation_data)} validation days."
+    msg = f"--- Training model for Fold {fold_num} | Training Days: {len(training_data)} | Validation Days: {len(validation_data)} ---"
     logger.info(msg)
     print(msg)
         
+    # --- 1. Model and Optimizer Setup ---
+    # Build the model from hyperparameters for the very first training run
     if fold_num == 0:
-        # For the very first training run, build the model from the hyperparameters.
-        # For subsequent recalibrations, this function receives an already-trained model
-        # and continues training it (fine-tuning).
         model = hypermodel.build(best_hps)
+    
+    # Set up the optimizer with the optimal *initial* learning rate from the tuner
     optimizer = tf.keras.optimizers.Adam(learning_rate=best_hps.get('lr'))
-    patience = settings.get("early_stopping_patience", 10)
-    subsample_frac = settings.get("OPTION_SUBSAMPLE_PERCENTAGE", 100) / 100.0
-    best_val_loss = float('inf')
-    patience_counter = 0
-    best_weights = None
+    
+    # We must compile the model to connect the optimizer, which allows callbacks
+    # to access and modify the learning rate. This does not interfere with our
+    # custom gradient logic.
+    model.compile(optimizer=optimizer)
 
-    for epoch in range(settings['num_epochs_final_training']):
-        msg = f"\n--- Fold {fold_num}, Epoch {epoch + 1}/{settings['num_epochs_final_training']} ---"
-        logger.info(msg)
-        print(msg)
-        # Loop through each day in the training data.
+    # --- 2. Callback Definition ---
+    # This callback reduces the learning rate when validation loss plateaus
+    lr_scheduler = ReduceLROnPlateau(
+        monitor='val_loss',
+        factor=settings.get("learning_rate_scheduler_factor", 0.2),   # new_lr = lr * factor
+        patience=settings.get("learning_rate_scheduler_patience", 3), # Epochs to wait for improvement before reducing LR
+        verbose=settings.get("learning_rate_verbose", 1),             # Print a message when the LR is updated
+        min_lr=settings.get("learning_rate_lower_bound", 1e-7)        # Lower bound on the learning rate
+    )
+
+    # This callback stops training early and automatically restores the best weights
+    early_stopper = EarlyStopping(
+        monitor='val_loss',
+        patience=settings.get("early_stopping_patience", 10),
+        verbose=settings.get("early_stopping_verbose", 1),
+        restore_best_weights=True # Automatically saves/restores the best model state
+    )
+    
+    lr_scheduler.set_model(model)
+    early_stopper.set_model(model)
+    
+    lr_scheduler.on_train_begin()
+    early_stopper.on_train_begin()
+
+    # --- 3. Main Training Loop ---
+    subsample_frac = settings.get("OPTION_SUBSAMPLE_PERCENTAGE", 100) / 100.0
+    max_epochs = settings['num_epochs_final_training']
+
+    for epoch in range(max_epochs):
+        print(f"\n--- Fold {fold_num}, Epoch {epoch + 1}/{max_epochs} ---")
+        
+        # Log the current learning rate at the start of each epoch
+        current_lr = float(model.optimizer.learning_rate.numpy())
+        print(f"Current Learning Rate: {current_lr:.8f}")
+
+        # Loop through each day in the training data with a progress bar
         for day_idx, (date, options, features, ql_objects) in enumerate(tqdm(training_data, desc=f'Progress within epoch {epoch + 1} of fold {fold_num}')):
-            helpers, rf_h, div_h, spot_h = ql_objects 
+            helpers, rf_h, div_h, spot_h = ql_objects
             if not helpers: continue
-            
+
+            # --- Option Subsampling Logic ---
             sampled_helpers = helpers
             if subsample_frac < 1.0:
-                # Create a deterministic but unique seed for this specific day and epoch
-                # This ensures run-to-run reproducibility while having different samples per epoch
+                # Create a deterministic seed for reproducibility
                 day_epoch_seed = config.GLOBAL_SEED + epoch * 100000 + day_idx
-                # Create a local random number generator instance to not interfere with global state
                 rng = random.Random(day_epoch_seed)
                 num_to_sample = int(len(helpers) * subsample_frac)
-                sampled_helpers = rng.sample(helpers, num_to_sample)
-                
+                if num_to_sample > 0:
+                    sampled_helpers = rng.sample(helpers, num_to_sample)
+            
             if not sampled_helpers: continue
 
-            # This is the core of the custom training step.
+            # --- Custom Training Step ---
             with tf.GradientTape() as tape:
                 params = model((scaler.transform(features[cols].values), logits), training=True)
                 
-                # The @tf.custom_gradient decorator allows us to define a forward pass (the loss
-                # calculation) and provide a custom function for the backward pass (the gradient).
                 @tf.custom_gradient
                 def loss_op(p):
-                    """
-                    Custom gradient function for the loss calculation.
-
-                    Parameters
-                    ----------
-                    p : tf.Tensor
-                        The model parameters.
-
-                    Returns
-                    -------
-                    Tuple[tf.float64, Callable[[tf.float64], tf.float64]]
-                        The loss and gradient function.
-
-                    Notes
-                    -----
-                    This function is used to calculate the loss and gradient of the model using the provided helpers and settings.
-                    The gradient is calculated using the finite difference method.
-                    The function returns a tuple containing the loss and the gradient function.
-                    """
                     loss, grad = tf.py_function(lambda t: _py_loss_and_grad_wrapper(t, sampled_helpers, rf_h, div_h, spot_h, settings, date), [p], [tf.float64]*2)
                     def grad_fn(dy): 
                         """
@@ -1026,40 +1044,31 @@ def train_model_for_fold(model, best_hps, training_data, validation_data, scaler
                 
                 loss = loss_op(params[0])
             
-            # Apply the computed gradients to the model's trainable variables.
+            # Apply the computed gradients to the model's trainable variables
             optimizer.apply_gradients(zip(tape.gradient(loss, model.trainable_variables), model.trainable_variables))
 
-        # After each epoch, evaluate the model on the validation set.
+        # --- 4. End-of-Epoch Evaluation and Callback Handling ---
         val_loss = _evaluate_model_on_data(model, validation_data, scaler, cols, logits)
         msg = f"Validation loss after Epoch {epoch + 1} of Fold {fold_num}: {val_loss:.6f}"
         logger.info(msg)
         print(msg)
         
-        # Implement early stopping.
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            patience_counter = 0
-            best_weights = model.get_weights() # Save the weights of the best performing model.
-            msg = f"  -> New best model found for Fold {fold_num} at Epoch {epoch + 1} with validation loss: {best_val_loss:.6f}"
-            logger.info(msg)
-            print(msg)
-        else:
-            patience_counter += 1
-            msg = f"  -> Validation loss did not improve. Patience: {patience_counter}/{patience}"
-            logger.info(msg)
-            print(msg)
+        # Manually trigger the callbacks, passing them the latest validation loss
+        logs = {'val_loss': val_loss}
+        lr_scheduler.on_epoch_end(epoch, logs)
+        early_stopper.on_epoch_end(epoch, logs)
 
-        if patience_counter >= patience:
+        # Check the flag set by the EarlyStopping callback
+        if model.stop_training:
             msg = f"  -> Early stopping triggered for Fold {fold_num} after {epoch + 1} epochs."
             logger.info(msg)
             print(msg)
             break
             
-    # After training, restore the weights that gave the best validation performance.
-    if best_weights:
-        logger.info(f"Restoring best weights for Fold {fold_num} with validation loss: {best_val_loss:.6f}")
-        model.set_weights(best_weights)
-        
+    early_stopper.on_train_end()
+    lr_scheduler.on_train_end()
+            
+    print(f"\nFinished training for Fold {fold_num}. The model has been restored to its best state.")   
     return model
 
 

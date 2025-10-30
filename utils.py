@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta
 import re
+import os
 from typing import Optional,Literal
 
 from openbb import obb
@@ -8,6 +9,7 @@ import pandas as pd
 import yfinance as yf
 
 import config
+from logger import create_logger
 
 def generate_date_list(start_str: str, end_str: str) -> list[str]:
     """
@@ -232,28 +234,43 @@ def get_underyling_features(symbol: str, start_str: str, end_str: str, volatilit
     vol_data_df.rename(columns={'close': 'underlying_price'}, inplace=True)
     return vol_data_df
 
-def create_full_dataset(underyling_df: pd.DataFrame,) -> pd.DataFrame:
-    max_lookback = max(volatility_timeframes + momentum_timeframes)
-    start_date = pd.to_datetime(start_str) - pd.Timedelta(days=max_lookback)
-    start_str_adjusted = start_date.strftime("%Y-%m-%d")
-    dfs = [
-        get_yield_curve(start_str_adjusted, end_str),
-        get_vix_index(start_str_adjusted, end_str),
-        get_volatility_skew_index(start_str_adjusted, end_str),
-        get_underyling_features(symbol, start_str_adjusted, end_str,
-                                volatility_timeframes, momentum_timeframes)
-    ]
-    for i, df in enumerate(dfs):
-        if 'date' not in df.columns:
-            df = df.reset_index()
-        df['date'] = pd.to_datetime(df['date']).dt.tz_localize(None)  # remove timezone info
-        dfs[i] = df
-    dataset_df = dfs[0]
-    for df in dfs[1:]:
-        dataset_df = dataset_df.merge(df, on='date', how='inner')
-    dataset_df.set_index('date', inplace=True)
-    dataset_df = dataset_df.loc[dataset_df.index >= pd.to_datetime(start_str)]
-    return dataset_df
+
+def get_daily_dividend_yield_cached(symbol, start_date, end_date, cache_dir="data/cache"):
+    """
+    Fetches the daily dividend yield for a given symbol and date range from the internet and caches the result.
+
+    Parameters
+    ----------
+    symbol : str
+        The symbol of the underlying asset.
+    start_date : str
+        The start date of the desired date range in 'YYYY-MM-DD' format.
+    end_date : str
+        The end date of the desired date range in 'YYYY-MM-DD' format.
+    cache_dir : str, optional
+        The directory to store the cached dividend yield data. Defaults to 'data/cache'.
+
+    Returns
+    -------
+    pd.DataFrame
+        A DataFrame containing the daily dividend yield for the given symbol and date range. The DataFrame has a 'date' column and a column for the dividend yield.
+
+    Notes
+    -----
+    The function first checks if a cached version of the dividend yield data exists in the specified cache directory. If it does, it loads the cached data. Otherwise, it fetches the data from the internet, caches it, and returns it.
+    """
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_file = os.path.join(cache_dir, f"{symbol}_dividend_yield_{start_date}_to_{end_date}.csv")
+
+    if os.path.exists(cache_file):
+        print(f"Loading cached dividend yield for {symbol} from {cache_file}")
+        return pd.read_csv(cache_file, parse_dates=['date'])
+    else:
+        print(f"Fetching dividend yield for {symbol} from network...")
+        dividend_df = get_daily_dividend_yield(symbol, start_date, end_date) # Your original function
+        dividend_df.to_csv(cache_file, index=False)
+        print(f"Saved dividend yield to cache: {cache_file}")
+        return dividend_df
 
 def get_daily_dividend_yield(
     symbol: str,
@@ -264,6 +281,7 @@ def get_daily_dividend_yield(
     Fetches historical dividends and creates a daily forward-filled annualized yield series.
     This corrected version handles zero-dividend stocks gracefully.
     """
+    logger = create_logger("utils.log")
     ticker = yf.Ticker(symbol)
     prices = ticker.history(start=start_date, end=end_date)['Close']
 

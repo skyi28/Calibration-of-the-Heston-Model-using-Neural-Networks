@@ -2,6 +2,7 @@ __pycache__/
 
 data/features.csv
 data/historical_option_data.csv
+data/cache/
 
 hyperband_tuner/heston_calibration/
 
