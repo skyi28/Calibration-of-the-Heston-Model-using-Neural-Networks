@@ -1,15 +1,15 @@
 {
-    "num_layers": 1,
-    "neurons_layer_0": 16,
-    "use_dropout": false,
-    "dropout": 0.30000000000000004,
-    "neurons_layer_1": 80,
+    "num_layers": 4,
+    "neurons_layer_0": 112,
+    "use_batchnorm": false,
+    "use_dropout": true,
+    "dropout": 0.2,
+    "tuner/epochs": 1,
+    "tuner/initial_epoch": 0,
+    "tuner/bracket": 0,
+    "tuner/round": 0,
+    "neurons_layer_1": 16,
     "neurons_layer_2": 16,
-    "neurons_layer_3": 64,
-    "lr": 0.006531232722772538,
-    "tuner/epochs": 40,
-    "tuner/initial_epoch": 10,
-    "tuner/bracket": 2,
-    "tuner/round": 2,
-    "tuner/trial_id": "0025"
+    "neurons_layer_3": 16,
+    "lr": 0.0001
 }

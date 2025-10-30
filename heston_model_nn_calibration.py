@@ -555,7 +555,7 @@ class ResidualParameterModel(tf.keras.Model):
     predicted parameters within their valid financial ranges (e.g., volatilities
     must be positive, correlation must be between -1 and 1).
     """
-    def __init__(self, total_params, upper_bounds_sigmoid, neuron_counts: list, use_dropout, dropout_rate, **kwargs):
+    def __init__(self, total_params, upper_bounds_sigmoid, neuron_counts: list, use_dropout, dropout_rate, use_batchnorm, **kwargs):
         """
         Initializes the model architecture.
 
@@ -574,11 +574,23 @@ class ResidualParameterModel(tf.keras.Model):
         """
         super().__init__(**kwargs)
         self.upper_bounds_sigmoid = tf.constant(upper_bounds_sigmoid, dtype=self.dtype)
-        self.hidden_layers = [tf.keras.layers.Dense(n, activation='relu') for n in neuron_counts]
-        self.dropout_layers = [tf.keras.layers.Dropout(dropout_rate) for _ in range(len(neuron_counts))] if use_dropout else []
+        
+        self.use_dropout = use_dropout
+        self.use_batchnorm = use_batchnorm
+        
+        self.network_layers = []
+        for i, num_neurons in enumerate(neuron_counts):
+            use_bias_for_batchnorm = not self.use_batchnorm
+            
+            self.network_layers.append(tf.keras.layers.Dense(num_neurons, use_bias=use_bias_for_batchnorm, name=f'dense_{i}'))
+            if self.use_batchnorm:
+                self.network_layersappend(tf.keras.layers.BatchNormalization(name=f'batchnorm_{i}'))
+            self.network_layers.append(tf.keras.layers.Activation('relu', name=f'relu_{i}'))
+            if self.use_dropout:
+                self.network_layers.append(tf.keras.layers.Dropout(dropout_rate, name=f'dropout_{i}'))            
         # The output layer is initialized with zeros, so the initial prediction is just the
         # initial guess, reinforcing the residual learning concept.
-        self.output_layer = tf.keras.layers.Dense(total_params, kernel_initializer='zeros', bias_initializer='zeros')
+        self.output_layer = tf.keras.layers.Dense(total_params, kernel_initializer='zeros', bias_initializer='zeros', name='output_delta')
 
     def call(self, inputs, training=False):
         """
@@ -598,10 +610,9 @@ class ResidualParameterModel(tf.keras.Model):
         """
         features, initial_logits = inputs
         x = features
-        for i, layer in enumerate(self.hidden_layers):
-            x = layer(x)
-            if self.dropout_layers and training: x = self.dropout_layers[i](x)
-        
+        for layer in self.network_layers:
+            x = layer(x, training=training)
+                    
         # The core of the residual connection: add the network's output to the initial guess logits.
         final_logits = initial_logits + self.output_layer(x)
         
@@ -1274,21 +1285,25 @@ class HestonHyperModel(kt.HyperModel):
             An instance of the model ready to be trained.
         """
         # Define a tunable number of layers.
-        num_layers = hp.Int('num_layers', min_value=1, max_value=4)
+        num_layers = hp.Int('num_layers', min_value=3, max_value=6, step=1)
         
         # Define a list of neuron counts, one for each layer.
         # This allows the tuner to find optimal widths for each layer individually.
         neuron_counts = [
-            hp.Int(f'neurons_layer_{i}', min_value=16, max_value=128, step=16)
+            hp.Int(f'neurons_layer_{i}', min_value=8, max_value=64, step=8)
             for i in range(num_layers)
         ]
+        
+        # Boolean flag for the usage of batch normalization.
+        use_batchnorm_hp = hp.Boolean('use_batchnorm')
 
         return ResidualParameterModel(
             total_params=self.total_params,
             upper_bounds_sigmoid=self.upper_bounds,
             neuron_counts=neuron_counts,
             use_dropout=hp.Boolean('use_dropout'),
-            dropout_rate=hp.Float('dropout', min_value=0.1, max_value=0.5, step=0.1)
+            dropout_rate=hp.Float('dropout', min_value=0.05, max_value=0.3, step=0.05),
+            use_batchnorm=use_batchnorm_hp
         )
         
 class HestonTuner(kt.Hyperband):
@@ -1424,8 +1439,8 @@ class HestonTuner(kt.Hyperband):
             The mean loss of the model on the validation set. If no data is available, returns float('inf').
         """
         losses = []
-        for date, options, features in val_data:
-            helpers, rf_h, div_h, spot_h = prepare_option_helpers(date, options, features, features['dividend_yield'].iloc[0])
+        for date, options, features, ql_objects in val_data:
+            helpers, rf_h, div_h, spot_h = ql_objects
             if helpers:
                 params = model((scaler.transform(features[cols].values), logits), training=False).numpy()[0]
                 py_date = pd.to_datetime(date).date()
