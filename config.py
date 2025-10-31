@@ -41,7 +41,7 @@ SETTINGS = {
     "MAX_FOLD_DAYS": 100,                               # Maximum number of days per fold when performance is monitored and model is recalibrated
     "MIN_FOLD_DAYS": 20,                                # Minimum number of days per fold when performance is monitored and model is recalibrated
     "num_epochs_final_training": 100,                   # The number of epochs to train the final model after hyperparameter tuning is complete, or during each retraining fold.
-    "early_stopping_patience": 10,                      # Number of epochs with no improvement after which training will be stopped
+    "early_stopping_patience": 20,                      # Number of epochs with no improvement after which training will be stopped
     "early_stopping_verbose": 1,                        # Verbosity level for early stopping
     "learning_rate_scheduler_patience": 3,              # Number of epochs with no improvement after which learning rate will be reduced
     "learning_rate_scheduler_factor": 0.2,              # Factor by which the learning rate will be reduced
