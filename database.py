@@ -18,6 +18,7 @@ class Database:
             
         try:
             self.connection = duckdb.connect(database_name)
+            self.logger.info("Connected to database: %s", database_name)
         except Exception:
             self.logger.critical(
                 "Failed to connect to database! \n%s", traceback.format_exc()
@@ -39,6 +40,9 @@ class Database:
                 CREATE TABLE IF NOT EXISTS {table_name} AS 
                 SELECT * FROM read_csv_auto('{csv_path}')
                 """
+            )
+            self.logger.info(
+                "Created table %s from CSV %s", table_name, csv_path
             )
         except Exception:
             self.logger.error(
@@ -62,6 +66,7 @@ class Database:
         """
         try:
             result = self.connection.execute(query, args)
+            self.logger.info("Executed read query: %s", query)
             if return_as_dataframe:
                 return result.df()
             return result.fetchall()
@@ -82,6 +87,7 @@ class Database:
         """
         try:
             self.connection.execute(query)
+            self.logger.info("Executed write query: %s", query)
             return True
         except Exception:
             self.logger.error(
@@ -109,6 +115,7 @@ class Database:
                 [table_name],
             ).fetchone()
             
+            self.logger.info("Checked if table %s exists.", table_name)
             if isinstance(result, tuple):
                 result = result[0]
                 return result > 0
@@ -121,3 +128,83 @@ class Database:
                 e,
             )
             return False
+        
+    def create_table_from_df(
+        self, table_name: str, df: pd.DataFrame, if_exists: str = "fail"
+    ) -> None:
+        """
+        Creates or modifies a table in the database from a pandas DataFrame.
+
+        This method leverages DuckDB's direct support for pandas DataFrames,
+        making it highly efficient.
+
+        Parameters
+        ----------
+        table_name : str
+            The name of the table to be created or modified.
+        df : pd.DataFrame
+            The DataFrame containing the data to be written.
+        if_exists : str, optional
+            How to behave if the table already exists. Can be one of:
+            - 'fail': Raise a ValueError. (Default)
+            - 'replace': Drop the table before inserting new values.
+            - 'append': Insert new values to the existing table.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        ValueError
+            If the table exists and `if_exists` is 'fail', or if an invalid
+            value for `if_exists` is provided.
+        Exception
+            If any other database error occurs during the operation.
+        """
+        if df.empty:
+            self.logger.warning(
+                "DataFrame is empty. Skipping table creation for '%s'.", table_name
+            )
+            return
+
+        try:
+            if if_exists == "replace":
+                # Atomically creates a new table or replaces an existing one.
+                self.connection.sql(f"CREATE OR REPLACE TABLE {table_name} AS SELECT * FROM df")
+                self.logger.info(
+                    "Successfully created or replaced table '%s' with %d rows.",
+                    table_name,
+                    len(df),
+                )
+
+            elif if_exists == "append":
+                # Appends data from the DataFrame to an existing table.
+                self.connection.sql(f"INSERT INTO {table_name} SELECT * FROM df")
+                self.logger.info(
+                    "Successfully appended %d rows to table '%s'.", len(df), table_name
+                )
+
+            elif if_exists == "fail":
+                # Default behavior: check for existence before creating.
+                if self.check_if_table_exists(table_name):
+                    raise ValueError(f"Table '{table_name}' already exists.")
+                
+                self.connection.sql(f"CREATE TABLE {table_name} AS SELECT * FROM df")
+                self.logger.info(
+                    "Successfully created new table '%s' with %d rows.", table_name, len(df)
+                )
+
+            else:
+                # --- Handle invalid 'if_exists' arguments ---
+                raise ValueError(
+                    f"Invalid value for if_exists: '{if_exists}'. "
+                    "Expected 'fail', 'replace', or 'append'."
+                )
+
+        except Exception:
+            self.logger.error(
+                "Failed to create/modify table '%s' from DataFrame! \n%s",
+                table_name,
+                traceback.format_exc(),
+            )
