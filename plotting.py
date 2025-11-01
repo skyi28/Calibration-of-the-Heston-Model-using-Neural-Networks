@@ -391,3 +391,130 @@ def plot_shap_feature_importance(shap_values: List[np.ndarray], features: pd.Dat
         plt.savefig(save_path)
         plt.close()
         print(f"Saved SHAP feature importance plot to {save_path}")
+        
+def save_statistical_tables(df: pd.DataFrame, output_dir: str):
+    """
+    Calculates and saves descriptive statistics for a DataFrame to text files.
+
+    This function generates three files:
+    1. A summary of main descriptive statistics (count, mean, std, etc.).
+    2. A summary of skewness and kurtosis.
+    3. A combined table containing all of the above metrics.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        The input DataFrame to analyze.
+    output_dir : str
+        The directory path where the summary text files will be saved.
+    """
+    print(f"Generating statistical tables in directory: {output_dir}")
+    
+    # --- Action 1: Save the main descriptive statistics summary ---
+    try:
+        summary = df.describe()
+        summary_path = os.path.join(output_dir, "descriptive_summary.txt")
+        with open(summary_path, "w") as f:
+            f.write("Main Descriptive Statistics Summary\n")
+            f.write("=" * 40 + "\n\n")
+            f.write(summary.to_string())
+        print(f"Saved descriptive summary to {summary_path}")
+    except Exception as e:
+        print(f"Error saving descriptive summary: {e}")
+
+    # --- Action 2: Save skewness and kurtosis summary ---
+    try:
+        skew = df.skew(numeric_only=True)
+        kurt = df.kurtosis(numeric_only=True)
+        skew_kurt_df = pd.DataFrame({'skewness': skew, 'kurtosis': kurt})
+        
+        skew_kurt_path = os.path.join(output_dir, "skew_kurtosis_summary.txt")
+        with open(skew_kurt_path, "w") as f:
+            f.write("Skewness and Kurtosis Summary\n")
+            f.write("=" * 40 + "\n\n")
+            f.write(skew_kurt_df.to_string())
+        print(f"Saved skew/kurtosis summary to {skew_kurt_path}")
+    except Exception as e:
+        print(f"Error saving skew/kurtosis summary: {e}")
+        
+    # --- Action 3: Save a combined table ---
+    try:
+        # To combine, we append the skew/kurtosis DataFrame to the describe() output
+        combined_stats = pd.concat([summary, skew_kurt_df.T])
+        combined_path = os.path.join(output_dir, "all_statistics.txt")
+        with open(combined_path, "w") as f:
+            f.write("Combined Statistical Summary\n")
+            f.write("=" * 40 + "\n\n")
+            f.write(combined_stats.to_string())
+        print(f"Saved all statistics to {combined_path}")
+    except Exception as e:
+        print(f"Error saving combined statistics: {e}")
+
+
+def generate_statistical_plots(df: pd.DataFrame, output_dir: str):
+    """
+    Generates and saves a grid of histograms and box plots for all numerical columns.
+
+    For readability, this function automatically splits the plots into multiple
+    image files if the number of numerical features is large. Each plot file
+    contains a grid with histograms in the top row and corresponding box plots
+    in the bottom row.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        The input DataFrame to analyze.
+    output_dir : str
+        The directory path where the plot images will be saved.
+    """
+    print(f"Generating statistical plots in directory: {output_dir}")
+    
+    # Identify all numerical columns for plotting
+    numerical_cols = df.select_dtypes(include=np.number).columns.tolist()
+    if not numerical_cols:
+        print("No numerical columns found to generate plots.")
+        return
+
+    # --- Architectural Decision ---
+    # To prevent creating overly wide and unreadable plots, we limit the number
+    # of feature columns per image file. This is more robust than trying to fit
+    # dozens of plots into a single figure.
+    COLS_PER_PLOT = 6
+    col_chunks = [numerical_cols[i:i + COLS_PER_PLOT] for i in range(0, len(numerical_cols), COLS_PER_PLOT)]
+
+    for i, chunk in enumerate(col_chunks):
+        num_cols_in_chunk = len(chunk)
+        
+        # Create a subplot grid with 2 rows (histograms, box plots) and N columns
+        fig, axes = plt.subplots(2, num_cols_in_chunk, figsize=(num_cols_in_chunk * 5, 10))
+        
+        # Ensure 'axes' is always a 2D array for consistent indexing, even with one column
+        if num_cols_in_chunk == 1:
+            axes = np.array(axes).reshape(2, 1)
+
+        for j, col_name in enumerate(chunk):
+            # Top Row: Histograms
+            hist_ax = axes[0, j]
+            sns.histplot(data=df, x=col_name, ax=hist_ax, kde=True)
+            hist_ax.set_title(f"Histogram of {col_name}")
+            hist_ax.set_xlabel("")  # Clean up x-label for clarity
+
+            # Bottom Row: Box Plots
+            box_ax = axes[1, j]
+            sns.boxplot(data=df, y=col_name, ax=box_ax)
+            box_ax.set_title(f"Box Plot of {col_name}")
+            box_ax.set_ylabel(col_name) # Keep y-label as it's informative for box plots
+
+        plt.tight_layout()
+
+        # Save the figure to a file
+        plot_filename = f"combined_statistics_plot_part_{i+1}.png"
+        save_path = os.path.join(output_dir, plot_filename)
+        try:
+            plt.savefig(save_path)
+            print(f"Saved plot chunk {i+1} to {save_path}")
+        except Exception as e:
+            print(f"Error saving plot {save_path}: {e}")
+        finally:
+            # Ensure the figure is closed to free up memory
+            plt.close(fig)

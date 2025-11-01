@@ -68,3 +68,4 @@ RECALIBRATION_THRESHOLD_FACTOR: float = 1.2             # The factor by which th
 
 # ------------------OUTPUT DIRECTORIES------------------
 OUTPUT_BASE_DIR: str = 'results'                        # Base directory to store all run outputs
+DESCRIPTIVE_ANALYSIS_OUTPUT_DIR: str = 'descriptive_statistics'  # Directory to store descriptive statistical analysis results

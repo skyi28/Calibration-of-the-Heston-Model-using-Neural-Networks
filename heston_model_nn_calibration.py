@@ -244,6 +244,41 @@ else:
         logger.info(msg)
         print(msg)
 
+def run_descriptive_analysis(df: pd.DataFrame):
+    """
+    Orchestrates the descriptive statistical analysis of the input DataFrame.
+
+    This function creates a dedicated output directory and calls plotting functions
+    to generate and save statistical tables and plots. This analysis provides
+    a baseline understanding of the feature distributions and characteristics
+    before any model training.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        The complete DataFrame containing all features to be analyzed.
+    """
+    output_dir = config.DESCRIPTIVE_ANALYSIS_OUTPUT_DIR
+    msg = f"\n--- Running Descriptive Statistical Analysis (Output: ./{output_dir}) ---"
+    logger.info(msg)
+    print(msg)
+    
+    try:
+        # Create the output directory; exist_ok=True prevents errors if it already exists.
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Call the external plotting functions to generate the analysis files.
+        plotting.save_statistical_tables(df, output_dir)
+        plotting.generate_statistical_plots(df, output_dir)
+        
+        msg = "Descriptive statistical analysis completed successfully."
+        logger.info(msg)
+        print(msg)
+                
+    except Exception as e:
+        msg = f"An error occurred during descriptive statistical analysis: {e}"
+        logger.error(msg, exc_info=True)
+        print(msg)
 
 def load_and_split_data(db_connection: duckdb.DuckDBPyConnection, symbol: str, options_table: str, features_table: str,
                         pca_model: PCA|None = None, pca_cols: List[str]|None = None) -> Tuple[List, List]:
@@ -1635,7 +1670,16 @@ if __name__ == '__main__':
             db.connection, config.SYMBOL, config.OPTIONS_DATA_TABLE, config.FEATURES_DATA_TABLE,
             pca_model=pca_model, pca_cols=pca_cols
         )
-                
+        
+        # Combine feature DataFrames from both training and monitoring splits to
+        # analyze the entire dataset after feature engineering is complete.
+        if initial_train_data or monitoring_data:
+            all_features_list = [f for _, _, f in initial_train_data] + [f for _, _, f in monitoring_data]
+            if all_features_list:
+                full_features_df = pd.concat(all_features_list, ignore_index=True)
+                run_descriptive_analysis(full_features_df)
+        # ======================================================================
+
         initial_train_data_processed = preprocess_ql_helpers(initial_train_data)
         monitoring_data_processed = preprocess_ql_helpers(monitoring_data)
 
