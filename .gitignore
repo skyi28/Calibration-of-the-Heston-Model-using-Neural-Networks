@@ -6,10 +6,4 @@ data/cache/
 
 hyperband_tuner/heston_calibration/
 
-Literature/
-
-logs/
-
 historical_option_data.db
-
-# results/

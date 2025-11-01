@@ -1,1 +1,5 @@
-https://www.dolthub.com/repositories/post-no-preference/options/data/master
+The historical option data utilized in this project was sourced from the 'post-no-preference/options' repository on DoltHub. The full dataset was downloaded on September 15, 2025, in the form of a single comma-separated values (CSV) file with an approximate size of 8 GB.
+
+The data source is available at: https://www.dolthub.com/repositories/post-no-preference/options/data/master
+
+It is important to note that this repository is updated daily; therefore, the specific data snapshot used for this analysis corresponds to the state of the repository on the aforementioned download date.
