@@ -58,6 +58,10 @@ import ruptures as rpt
 import keras_tuner as kt
 import yfinance as yf
 from tqdm import tqdm
+import shap
+
+from warnings import filterwarnings
+filterwarnings("ignore")
 
 # Set the global floating-point policy for TensorFlow to float64.
 # This is crucial for numerical stability in financial calculations, especially
@@ -1170,69 +1174,80 @@ def run_adaptive_window_evaluation(model, scaler, cols, logits, settings, best_h
                                    monitoring_data: List,
                                    run_output_dir: str):
     """
-    Runs an adaptive window evaluation on the given model.
+    Orchestrates the main adaptive window evaluation loop, simulating a real-world
+    deployment scenario.
 
-    The evaluation is an iterative process, where the model is re-trained on the most recent data points and evaluated
-    on the next set of days. The process is repeated until the maximum number of days per fold is reached or the model's
-    performance degrades.
+    The process is iterative:
+    1. A model is trained/retrained on a sliding window of historical data.
+    2. It is then evaluated on subsequent, unseen days.
+    3. Performance is monitored using change-point detection on error metrics.
+    4. If performance degrades or a max duration is reached, a "fold" ends.
+    5. A SHAP analysis is performed to interpret the model's behavior during the fold.
+    6. The evaluation data is absorbed into the training set, and the cycle repeats.
 
-    The function returns the model with the best parameters found during the evaluation process.
+    This method generates detailed, fold-specific outputs, including model weights,
+    performance metrics, and SHAP plots for model interpretability.
 
     Parameters
     ----------
-    model : keras.Model
-        The model to evaluate.
-    scaler : sklearn.preprocessing.StandardScaler
-        The scaler used to scale the features.
+    model : tf.keras.Model
+        The initial trained Keras model.
+    scaler : StandardScaler
+        The fitted feature scaler.
     cols : List[str]
-        The columns of the features to use.
-    logits : List[int]
-        The number of days to consider for each option.
-    settings : Dict[str, Any]
-        Dictionary containing the settings for the model.
-    best_hps : Dict[str, Any]
-        Dictionary containing the best hyperparameters found so far.
+        List of feature column names to be used.
+    logits : tf.Tensor
+        The baseline logits for the residual model architecture.
+    settings : Dict
+        A dictionary of configuration settings.
+    best_hps : kt.HyperParameters
+        The best hyperparameters found by the tuner.
     initial_training_data : List
-        The initial data points to use for training.
+        The pre-processed initial training dataset.
     monitoring_data : List
-        The data points to use for evaluation.
+        The pre-processed data for out-of-sample monitoring.
     run_output_dir : str
-        The directory where to save the evaluation results.
-
-    Returns
-    -------
-    keras.Model
-        The model with the best parameters found during the evaluation process.
+        The base directory for all outputs of this run.
     """
     msg = "\n--- Starting Adaptive Window Evaluation ---"
     logger.info(msg)
     print(msg)
 
+    # Initialize data containers and loop control variables
     current_training_data = list(initial_training_data)
     all_fold_summaries, all_daily_metrics, all_option_results, all_model_parameters = [], [], [], []
     surface_plot_data = None
     monitoring_idx = 0
 
-    # The main loop that steps through the monitoring data.
+    # The main loop that steps through the monitoring data, defining each "fold".
     while monitoring_idx < len(monitoring_data):
         fold_num = len(all_fold_summaries) + 1
+        msg = f"\n{'='*20} Starting Fold {fold_num} {'='*20}"
+        logger.info(msg)
+        print(msg)
 
-        # Recalibrate the model at the beginning of each new fold (except the first).
+        # --- 1. Create a dedicated directory for the current fold's artifacts ---
+        fold_output_dir = os.path.join(run_output_dir, f"fold_{fold_num}")
+        os.makedirs(fold_output_dir, exist_ok=True)
+        logger.info(f"Created output directory for fold {fold_num}: {fold_output_dir}")
+
+        # --- 2. Recalibrate (retrain) the model at the start of each new fold ---
         if fold_num > 1:
-            val_split_idx = int(len(current_training_data) * 0.8)
+            val_split_idx = int(len(current_training_data) * (1 - config.VALIDATION_SET_PERCENTAGE / 100))
             train_split, val_split = current_training_data[:val_split_idx], current_training_data[val_split_idx:]
             msg = f"Splitting data for fold {fold_num} retraining: {len(train_split)} days for training, {len(val_split)} for validation."
             logger.info(msg)
             print(msg)
-            # Fine-tune the existing model on the updated training data.
+            
             model = train_model_for_fold(model, best_hps, train_split, val_split, scaler, cols, logits, settings, fold_num)
-            model_save_path = os.path.join(run_output_dir, f"fold_{fold_num - 1}_model.weights.h5")
+            
+            model_save_path = os.path.join(fold_output_dir, "model.weights.h5")
             model.save_weights(model_save_path)
-            msg = f"Retrained model for Fold {fold_num - 1} saved to {model_save_path}."
+            msg = f"Retrained model for Fold {fold_num} saved to {model_save_path}."
             logger.info(msg)
             print(msg)
 
-        # Record the model parameters used at the start of the fold.
+        # Record the model parameters used at the start of the fold for drift analysis.
         last_day_features = scaler.transform(current_training_data[-1][2][cols].values)
         params = model((last_day_features, logits), training=False).numpy()[0]
         param_names = ['v0', 'kappa', 'theta', 'sigma', 'rho']
@@ -1243,11 +1258,13 @@ def run_adaptive_window_evaluation(model, scaler, cols, logits, settings, best_h
         msg = f"Monitoring model performance for fold {fold_num}..."
         logger.info(msg)
         print(msg)
+        
         current_fold_metrics = []
+        current_fold_features_list = []
         fold_start_date = monitoring_data[monitoring_idx][0]
         reason = "End of data"
 
-        # Inner loop to evaluate day-by-day until a recalibration is needed.
+        # --- 3. Inner loop: Evaluate day-by-day until a recalibration is needed ---
         while monitoring_idx < len(monitoring_data):
             day_data = monitoring_data[monitoring_idx]
             daily_metrics, option_results = evaluate_single_day(model, scaler, cols, logits, day_data)
@@ -1255,13 +1272,14 @@ def run_adaptive_window_evaluation(model, scaler, cols, logits, settings, best_h
             if not np.isnan(daily_metrics['mae']):
                 current_fold_metrics.append(daily_metrics)
                 all_option_results.extend(option_results)
+                current_fold_features_list.append(day_data[2])
 
-            # Capture data for a 3D surface plot on the first day of evaluation.
             if fold_num == 1 and not surface_plot_data:
                 surface_plot_data = (pd.DataFrame(option_results), day_data[0])
 
             monitoring_idx += 1
             metrics_df = pd.DataFrame(current_fold_metrics)
+            
             recalibration_needed = perform_recalibration_tests(metrics_df, settings)
             max_days_reached = len(metrics_df) >= settings.get('MAX_FOLD_DAYS', 100)
 
@@ -1271,26 +1289,74 @@ def run_adaptive_window_evaluation(model, scaler, cols, logits, settings, best_h
                 logger.info(msg)
                 print(msg)
                 break
-
+        
         fold_end_date = monitoring_data[monitoring_idx - 1][0]
         final_metrics_df = pd.DataFrame(current_fold_metrics)
         all_daily_metrics.extend(current_fold_metrics)
+        
+        # --- 4. Post-Fold Analysis: SHAP Interpretability ---
+        if current_fold_features_list:
+            msg = f"\n--- Post-Fold SHAP Analysis for Fold {fold_num} ---"
+            logger.info(msg)
+            print(msg)
 
-        # Summarize the performance of the completed fold.
+            monitoring_features_df = pd.concat(current_fold_features_list, ignore_index=True)
+            scaled_monitoring_features = scaler.transform(monitoring_features_df[cols].values)
+
+            num_background_samples = min(100, len(current_training_data))
+            background_indices = np.random.choice(len(current_training_data), num_background_samples, replace=False)
+            background_data_list = [current_training_data[i][2] for i in background_indices]
+            background_features_df = pd.concat(background_data_list, ignore_index=True)
+            scaled_background_features = scaler.transform(background_features_df[cols].values)
+            
+            def predict_fn(features_numpy):
+                features_tensor = tf.convert_to_tensor(features_numpy, dtype=tf.float64)
+                tiled_logits = tf.tile(logits, [tf.shape(features_tensor)[0], 1])
+                predictions = model([features_tensor, tiled_logits], training=False)
+                return predictions.numpy()
+
+            background_summary = shap.kmeans(scaled_background_features, 50).data
+            explainer = shap.KernelExplainer(predict_fn, background_summary)
+            
+            msg = f"Calculating SHAP values for {scaled_monitoring_features.shape[0]} evaluation samples using KernelExplainer..."
+            logger.info(msg)
+            print(msg)
+            
+            # KernelExplainer returns a single 3D array (samples, features, outputs)
+            shap_values_3d = explainer.shap_values(scaled_monitoring_features)
+
+            # ** THE FIX **
+            # The plotting functions expect a list of 2D arrays (one for each output).
+            # We must convert the 3D array from KernelExplainer into this list format.
+            shap_values_list = [shap_values_3d[:, :, i] for i in range(shap_values_3d.shape[2])]
+
+            # Pass the correctly formatted list to the plotting functions.
+            plotting.plot_shap_summary(shap_values_list, monitoring_features_df[cols], fold_output_dir, fold_num)
+            plotting.plot_shap_feature_importance(shap_values_list, monitoring_features_df[cols], fold_output_dir, fold_num)
+        else:
+            logger.warning(f"Skipping SHAP analysis for Fold {fold_num} as no evaluation data was collected.")
+
+        # --- 5. Summarize and save fold results ---
         if not final_metrics_df.empty:
-            summary = {'fold_num': fold_num, 'start_date': fold_start_date, 'end_date': fold_end_date,
-                       'duration_days': len(final_metrics_df), 'avg_mae': final_metrics_df['mae'].mean(),
-                       'avg_rmse': final_metrics_df['rmse'].mean(), 'end_reason': reason}
+            summary = {
+                'fold_num': fold_num, 
+                'start_date': fold_start_date, 
+                'end_date': fold_end_date,
+                'duration_days': len(final_metrics_df), 
+                'avg_mae': final_metrics_df['mae'].mean(),
+                'avg_rmse': final_metrics_df['rmse'].mean(), 
+                'end_reason': reason
+            }
             all_fold_summaries.append(summary)
+            final_metrics_df.to_csv(os.path.join(fold_output_dir, "daily_metrics_for_fold.csv"), index=False)
             msg = f"Fold {fold_num} Summary: Duration={summary['duration_days']} days, Avg MAE={summary['avg_mae']:.4f}, Avg RMSE={summary['avg_rmse']:.4f}"
             logger.info(msg)
             print(msg)
 
-        # Expand the training data with the data from the fold that just completed.
-        current_training_data.extend(monitoring_data[monitoring_idx - len(final_metrics_df): monitoring_idx])
+        current_training_data.extend(monitoring_data[monitoring_idx - len(final_metrics_df) : monitoring_idx])
 
-    # --- Save all collected data and generate final plots ---
-    msg = "\n--- Finalizing Run: Saving Data and Generating Plots ---"
+    # --- 6. Finalizing Run: Saving Aggregate Data and Generating Overall Plots ---
+    msg = "\n--- Finalizing Run: Saving Aggregate Data and Generating Overall Plots ---"
     logger.info(msg)
     print(msg)
     summary_df = pd.DataFrame(all_fold_summaries)
@@ -1298,11 +1364,11 @@ def run_adaptive_window_evaluation(model, scaler, cols, logits, settings, best_h
     option_results_df = pd.DataFrame(all_option_results)
     parameter_df = pd.DataFrame(all_model_parameters)
 
-    summary_df.to_csv(os.path.join(run_output_dir, "evaluation_summary.csv"), index=False)
-    daily_metrics_df.to_csv(os.path.join(run_output_dir, "daily_metrics.csv"), index=False)
-    option_results_df.to_csv(os.path.join(run_output_dir, "option_level_results.csv"), index=False)
-    parameter_df.to_csv(os.path.join(run_output_dir, "model_parameters.csv"), index=False)
-    msg = f"Saved all result dataframes to {run_output_dir}"
+    summary_df.to_csv(os.path.join(run_output_dir, "evaluation_summary_all_folds.csv"), index=False)
+    daily_metrics_df.to_csv(os.path.join(run_output_dir, "daily_metrics_all_folds.csv"), index=False)
+    option_results_df.to_csv(os.path.join(run_output_dir, "option_level_results_all_folds.csv"), index=False)
+    parameter_df.to_csv(os.path.join(run_output_dir, "model_parameters_by_fold.csv"), index=False)
+    msg = f"Saved all aggregate result dataframes to {run_output_dir}"
     logger.info(msg)
     print(msg)
 
@@ -1311,8 +1377,7 @@ def run_adaptive_window_evaluation(model, scaler, cols, logits, settings, best_h
     plotting.plot_parameter_drift(parameter_df, run_output_dir)
     
     if not option_results_df.empty:
-        logger.info("Pre-processing option-level results for plotting...")
-        # Bin options by moneyness and maturity for more granular performance analysis.
+        logger.info("Pre-processing option-level results for overall plotting...")
         moneyness_bins = [0, 0.9, 1.0, 1.1, np.inf]
         moneyness_labels = ['Deep OTM (<0.9)', 'OTM (0.9-1.0)', 'ATM (1.0-1.1)', 'ITM (>1.1)']
         maturity_bins = [0, 0.25, 0.5, 1, np.inf]

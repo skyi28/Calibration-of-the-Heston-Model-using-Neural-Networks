@@ -32,7 +32,7 @@ MIN_MONEYNESS: float = 0.8                              # Minimum moneyness of o
 MAX_MONEYNESS: float = 1.2                              # Maximum moneyness of options to include
 
 # ------------------HYPERPARAMETER TUNING & TRAINING------------------
-RUN_HYPERPARAMETER_TUNING: bool = True                  # Run hyperparameter tuning
+RUN_HYPERPARAMETER_TUNING: bool = False                 # Run hyperparameter tuning
 TUNER_DIR: str = 'hyperband_tuner'                      # Path to store the hyperparameter tuning results      
 SETTINGS = {
     "gradient_method": "forward",                       # Options: "central" (more accurate) or "forward" (faster ~ 1.5x speedup) 

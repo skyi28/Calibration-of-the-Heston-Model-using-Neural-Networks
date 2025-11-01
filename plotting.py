@@ -323,3 +323,71 @@ def generate_and_save_correlation_heatmap(data_split: List, title: str, output_p
     plt.savefig(output_path)
     plt.close() # Close the plot to free up memory
     print(f"Saved correlation heatmap to: {output_path}")
+
+def plot_shap_summary(shap_values: List[np.ndarray], features: pd.DataFrame, output_dir: str, fold_num: int):
+    """
+    Generates and saves a SHAP beeswarm summary plot for each model output.
+
+    Parameters
+    ----------
+    shap_values : List[np.ndarray]
+        A list of SHAP value arrays, one for each model output.
+    features : pd.DataFrame
+        The feature data corresponding to the SHAP values.
+    output_dir : str
+        The directory where the plots will be saved.
+    fold_num : int
+        The current fold number, used for titling the plot.
+    """
+    import shap
+    param_names = ['v0', 'kappa', 'theta', 'sigma', 'rho']
+    
+    for i, param_name in enumerate(param_names):
+        plt.figure()
+        title = f'SHAP Summary for {param_name} (Fold {fold_num})'
+        shap.summary_plot(shap_values[i], features, show=False, plot_type="dot", cmap=plt.get_cmap("coolwarm"))
+        plt.title(title)
+        plt.tight_layout()
+        save_path = os.path.join(output_dir, f'shap_summary_{param_name}_fold_{fold_num}.png')
+        plt.savefig(save_path)
+        plt.close()
+        print(f"Saved SHAP summary plot to {save_path}")
+
+def plot_shap_feature_importance(shap_values: List[np.ndarray], features: pd.DataFrame, output_dir: str, fold_num: int):
+    """
+    Generates and saves a SHAP feature importance bar plot for each model output.
+
+    Parameters
+    ----------
+    shap_values : List[np.ndarray]
+        A list of SHAP value arrays, one for each model output.
+    features : pd.DataFrame
+        The feature data corresponding to the SHAP values.
+    output_dir : str
+        The directory where the plots will be saved.
+    fold_num : int
+        The current fold number, used for titling the plot.
+    """
+    import shap
+    param_names = ['v0', 'kappa', 'theta', 'sigma', 'rho']
+    
+    # Create a colormap instance
+    cmap = plt.get_cmap("coolwarm")
+    
+    for i, param_name in enumerate(param_names):
+        plt.figure()
+        title = f'SHAP Feature Importance for {param_name} (Fold {fold_num})'
+        
+        # To use a colormap with the bar plot, we need to pass an array of colors.
+        # We can create a simple gradient for visualization purposes.
+        feature_names = features.columns
+        num_features = len(feature_names)
+        colors = cmap(np.linspace(0, 1, num_features))
+        
+        shap.summary_plot(shap_values[i], features, show=False, plot_type="bar", color=colors)
+        plt.title(title)
+        plt.tight_layout()
+        save_path = os.path.join(output_dir, f'shap_importance_{param_name}_fold_{fold_num}.png')
+        plt.savefig(save_path)
+        plt.close()
+        print(f"Saved SHAP feature importance plot to {save_path}")
